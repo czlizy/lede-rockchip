@@ -1,7 +1,6 @@
 #!/bin/sh
 . /lib/netifd/netifd-wireless.sh
 . /lib/netifd/hostapd.sh
-. /lib/netifd/mac80211.sh
 
 init_wireless_driver "$@"
 
@@ -29,8 +28,8 @@ drv_mac80211_init_device_config() {
 	config_add_string tx_burst
 	config_add_string distance
 	config_add_int beacon_int chanbw frag rts
-	config_add_int rxantenna txantenna antenna_gain txpower
-	config_add_boolean noscan ht_coex acs_exclude_dfs
+	config_add_int rxantenna txantenna antenna_gain txpower min_tx_power
+	config_add_boolean noscan ht_coex acs_exclude_dfs background_radar
 	config_add_array ht_capab
 	config_add_array channels
 	config_add_array scan_list
@@ -138,12 +137,14 @@ mac80211_hostapd_setup_base() {
 	[ -n "$acs_exclude_dfs" ] && [ "$acs_exclude_dfs" -gt 0 ] &&
 		append base_cfg "acs_exclude_dfs=1" "$N"
 
-	json_get_vars noscan ht_coex vendor_vht
+	json_get_vars noscan ht_coex vendor_vht min_tx_power:0
 	json_get_values ht_capab_list ht_capab tx_burst
 	json_get_values channel_list channels
 
 	[ "$auto_channel" = 0 ] && [ -z "$channel_list" ] && \
 		channel_list="$channel"
+
+	[ "$min_tx_power" -gt 0 ] && append base_cfg "min_tx_power=$min_tx_power"
 
 	set_default noscan 0
 
@@ -274,6 +275,11 @@ mac80211_hostapd_setup_base() {
 			vht_center_seg0=$idx
 		;;
 	esac
+	[ "$band" = "5g" ] && {
+		json_get_vars background_radar:0
+
+		[ "$background_radar" -eq 1 ] && append base_cfg "enable_background_radar=1" "$N"
+	}
 	[ "$band" = "6g" ] && {
 		op_class=
 		case "$htmode" in
@@ -414,13 +420,22 @@ mac80211_hostapd_setup_base() {
 			he_spr_non_srg_obss_pd_max_offset:1 \
 			he_bss_color
 
-		he_phy_cap=$(iw phy "$phy" info | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
+		he_phy_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: AP/,$p' | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
 		he_phy_cap=${he_phy_cap:2}
-		he_mac_cap=$(iw phy "$phy" info | awk -F "[()]" '/HE MAC Capabilities/ { print $2 }' | head -1)
+		he_mac_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: AP/,$p' | awk -F "[()]" '/HE MAC Capabilities/ { print $2 }' | head -1)
 		he_mac_cap=${he_mac_cap:2}
 
 		append base_cfg "ieee80211ax=1" "$N"
-		[ -n "$he_bss_color" ] && append base_cfg "he_bss_color=$he_bss_color" "$N"
+
+		if [ -n "$he_bss_color" ]; then
+			append base_cfg "he_bss_color=$he_bss_color" "$N"
+		else
+			he_bss_color=$(head -1 /dev/urandom | tr -dc '0-9' | head -c2)
+			he_bss_color=$(($he_bss_color % 63))
+			he_bss_color=$(($he_bss_color + 1))
+			append base_cfg "he_bss_color=$he_bss_color" "$N"
+		fi
+
 		[ "$hwmode" = "a" ] && {
 			append base_cfg "he_oper_chwidth=$vht_oper_chwidth" "$N"
 			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
@@ -563,7 +578,7 @@ mac80211_generate_mac() {
 find_phy() {
 	[ -n "$phy" -a -d /sys/class/ieee80211/$phy ] && return 0
 	[ -n "$path" ] && {
-		phy="$(mac80211_path_to_phy "$path")"
+		phy="$(iwinfo nl80211 phyname "path=$path")"
 		[ -n "$phy" ] && return 0
 	}
 	[ -n "$macaddr" ] && {
@@ -620,8 +635,7 @@ mac80211_iw_interface_add() {
 	}
 
 	[ "$rc" = 233 ] && {
-		#iw dev "$ifname" del >/dev/null 2>&1
-    	ip link set dev "$ifname" down 2>/dev/null
+		iw dev "$ifname" del >/dev/null 2>&1
 		[ "$?" = 0 ] && {
 			sleep 1
 
@@ -725,7 +739,8 @@ mac80211_prepare_vif() {
 		;;
 	esac
 
-	if [ "$mode" != "ap" ]; then
+	# We do not set hostpad macaddr if it is 00:00:00:00:00:00
+	if [ "$mode" != "ap" ] && [ "$macaddr" != "00:00:00:00:00:00" ]; then
 		# ALL ap functionality will be passed to hostapd
 		# All interfaces must have unique mac addresses
 		# which can either be explicitly set in the device
@@ -744,13 +759,12 @@ mac80211_setup_supplicant() {
 	[ "$enable" = 0 ] && {
 		ubus call wpa_supplicant.${phy} config_remove "{\"iface\":\"$ifname\"}"
 		ip link set dev "$ifname" down
-		#iw dev "$ifname" del
+		iw dev "$ifname" del
 		return 0
 	}
 
 	wpa_supplicant_prepare_interface "$ifname" nl80211 || {
-		#iw dev "$ifname" del
-    	ip link set dev "$ifname" down
+		iw dev "$ifname" del
 		return 1
 	}
 	if [ "$mode" = "sta" ]; then
@@ -782,8 +796,7 @@ mac80211_setup_supplicant_noctl() {
 	local enable=$1
 	local spobj="$(ubus -S list | grep wpa_supplicant.${ifname})"
 	wpa_supplicant_prepare_interface "$ifname" nl80211 || {
-		#iw dev "$ifname" del
-    	ip link set dev "$ifname" down
+		iw dev "$ifname" del
 		return 1
 	}
 
@@ -1003,7 +1016,7 @@ mac80211_vap_cleanup() {
 	for wdev in $vaps; do
 		[ "$service" != "none" ] && ubus call ${service} config_remove "{\"iface\":\"$wdev\"}"
 		ip link set dev "$wdev" down 2>/dev/null
-		#iw dev "$wdev" del
+		iw dev "$wdev" del
 	done
 }
 
@@ -1064,7 +1077,7 @@ drv_mac80211_setup() {
 		done
 		if [ "$found" = "0" ]; then
 			ip link set dev "$wdev" down
-			#iw dev "$wdev" del
+			iw dev "$wdev" del
 		fi
 	done
 
